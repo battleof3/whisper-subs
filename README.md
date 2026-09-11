@@ -41,13 +41,14 @@ $ whisper-subs "Lecture 3.mp4"
 
 ## Install
 
-1. Download `whisper-subs-2.2.0-x86_64.AppImage` from the
-   [latest release](../../releases/latest).
-2. Make it executable and install it:
+1. Download the latest release: open the [latest release](../../releases/latest) page and get
+   the `.AppImage` file under **Assets**.
+2. In the folder you downloaded it to, make it executable and install it:
    ```sh
-   chmod +x whisper-subs-2.2.0-x86_64.AppImage
-   ./whisper-subs-2.2.0-x86_64.AppImage --install
+   chmod +x whisper-subs-*-x86_64.AppImage
+   ./whisper-subs-*-x86_64.AppImage --install
    ```
+   (If that folder has more than one version, use the full file name of the newest one.)
    This copies it to `~/.local/bin/whisper-subs` and offers to add that folder to your `PATH`
    (bash, zsh or fish). Remove it again with `whisper-subs --uninstall`.
 
