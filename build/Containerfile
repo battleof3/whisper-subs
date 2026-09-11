@@ -1,0 +1,24 @@
+# Build environment for whisper-subs' whisper.cpp engine.
+# Ubuntu 22.04 (glibc 2.35) so the binaries run on 2022+ distros; Vulkan headers, glslc and
+# SPIRV-Headers come from the LunarG SDK because 22.04's packages are too old for current ggml.
+# The SDK no longer ships the Vulkan loader, so libvulkan.so (link-time only; the target's
+# driver stack provides it at runtime) comes from Ubuntu's libvulkan-dev.
+FROM docker.io/library/ubuntu:22.04
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential git curl ca-certificates xz-utils file patchelf python3-pip \
+      libvulkan-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# 22.04 ships CMake 3.22; FindVulkan's glslc component handling needs a newer one.
+RUN pip3 install --no-cache-dir "cmake>=3.28" ninja
+
+ARG VULKAN_SDK_VERSION=1.4.357.1
+RUN curl -sSfL "https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz" \
+      | tar -xJ -C /opt \
+ && ln -s /opt/${VULKAN_SDK_VERSION}/x86_64 /opt/vulkan-sdk
+ENV VULKAN_SDK=/opt/vulkan-sdk \
+    PATH=/opt/vulkan-sdk/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/vulkan-sdk/lib \
+    CMAKE_PREFIX_PATH=/opt/vulkan-sdk

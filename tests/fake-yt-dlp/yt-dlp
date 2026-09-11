@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Offline stand-in for yt-dlp, for tests/channel_test.sh. Understands only what whisper-subs uses:
+#   --flat-playlist --print '%(id)s<TAB>%(title)s' [--playlist-items 1:N] URL   -> $FAKE_LIST lines
+#   [-f ba/b] -o TEMPLATE --print-to-file after_move:TEMPLATE FILE URL        -> copies $FAKE_MEDIA
+# Every call is appended to $FAKE_LOG. IDs listed in $FAKE_FAIL fail like private videos.
+# $FAKE_SLEEP makes downloads take that many seconds (for Ctrl-C tests); $FAKE_FLAKY IDs fail
+# once with an HTTP 403, then work.
+printf '%s\n' "$*" >> "$FAKE_LOG"
+
+flat=0 audio=0 items='' tmpl='' printfile='' printtmpl='' url=''
+while (( $# )); do
+    case $1 in
+        --flat-playlist) flat=1 ;;
+        --playlist-items) items=$2; shift ;;
+        -f) [[ $2 == ba* ]] && audio=1; shift ;;
+        -o) tmpl=$2; shift ;;
+        --print-to-file) printtmpl=${2#after_move:}; printfile=$3; shift 2 ;;
+        -S|--print|--ffmpeg-location|--sleep-interval|--max-sleep-interval|--sleep-requests) shift ;;
+        -*) ;;
+        *) url=$1 ;;
+    esac
+    shift
+done
+
+if (( flat )); then
+    echo "LIST_URL $url" >> "$FAKE_LOG"
+    if [[ $url == *watch?v=* ]]; then cat "$FAKE_LIST" "${FAKE_LIST2:-/dev/null}" | grep -m1 "^${url##*v=}"$'\t'
+    elif [[ $url == *list=PLsecond* ]]; then cat "$FAKE_LIST2"
+    elif [[ -n $items ]]; then head -n "${items#1:}" "$FAKE_LIST"
+    else cat "$FAKE_LIST"; fi
+    exit 0
+fi
+
+id=${url##*v=}
+for f in ${FAKE_FAIL:-}; do
+    [[ $f == "$id" ]] && { echo "ERROR: [youtube] $id: Private video. Sign in if you've been granted access" >&2; exit 1; }
+done
+for f in ${FAKE_FLAKY:-}; do
+    if [[ $f == "$id" && ! -e "$FAKE_LOG.flaky.$id" ]]; then
+        touch "$FAKE_LOG.flaky.$id"; echo "ERROR: unable to download video data: HTTP Error 403: Forbidden" >&2; exit 1
+    fi
+done
+title=$(cat "$FAKE_LIST" "${FAKE_LIST2:-/dev/null}" | awk -F'\t' -v id="$id" '$1 == id { print $2; exit }')
+n=$(cat "$FAKE_LIST" "${FAKE_LIST2:-/dev/null}" | awk -F'\t' -v id="$id" '$1 == id { print NR; exit }')
+ext=mp4; (( audio )) && ext=m4a
+path=${tmpl//'%(upload_date>%Y-%m-%d)s'/2024-01-0$n}
+path=${path//'%(title).150B'/$title}
+path=${path//'%(id)s'/$id}
+path=${path//'%(ext)s'/$ext}
+echo "DOWNLOAD $id $ext" >> "$FAKE_LOG"
+sleep "${FAKE_SLEEP:-0}"
+if (( audio )); then
+    ffmpeg -loglevel error -nostdin -y -i "$FAKE_MEDIA" -vn -c:a copy "$path" || exit 1
+else
+    cp -- "$FAKE_MEDIA" "$path" || exit 1
+fi
+if [[ -n $printfile ]]; then
+    out=${printtmpl//'%(filepath)s'/$path}
+    out=${out//'%(upload_date>%Y-%m-%d)s'/2024-01-0$n}
+    out=${out//'%(title)s'/$title}
+    printf '%s\n' "$out" >> "$printfile"
+fi
+exit 0

@@ -1,0 +1,45 @@
+# Allow-list: everything is ignored except the files named below. Build output, downloaded
+# sources/models, test output and local benchmark data (which includes other people's videos and
+# transcripts) must never be committed.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/CHANGELOG.md
+!/THIRD_PARTY_NOTICES.md
+!/licenses/
+
+!/src/
+/src/*
+!/src/whisper-subs
+
+!/build/
+/build/*
+!/build/Containerfile
+!/build/build-all.sh
+!/build/fetch.sh
+!/build/build-engine.sh
+!/build/build-ffmpeg.sh
+!/build/package.sh
+!/build/whisper-subs.svg
+
+!/tests/
+/tests/*
+!/tests/README.md
+!/tests/unit_bash.sh
+!/tests/awk_test.sh
+!/tests/reference_postprocess.py
+!/tests/regroup_test.sh
+!/tests/behavior_test.sh
+!/tests/channel_test.sh
+!/tests/install_test.sh
+!/tests/distro_test.sh
+!/tests/make_qa_media.sh
+!/tests/run_batch.sh
+!/tests/interrupt_test.sh
+!/tests/memprobe.sh
+!/tests/withint.py
+!/tests/fake-yt-dlp/
+!/tests/speech/
+/tests/speech/*
+!/tests/speech/jfk.flac

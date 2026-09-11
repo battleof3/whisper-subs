@@ -1,0 +1,1146 @@
+#!/usr/bin/env bash
+# whisper-subs: transcribe videos with Whisper and add the result as a subtitle track.
+#
+# Usage:
+#   whisper-subs [options] video.mp4 [more videos...]
+#   whisper-subs [options]      (then drag file(s) into the terminal and press Enter)
+#
+# Everything ends up in a folder next to where the video was ("name (subtitled)/"):
+#   name.mp4             the original video (moved here once processing succeeds)
+#   name.subtitled.mp4   the video with a toggleable subtitle track
+#                        (non-mp4/mov inputs are written as .mkv)
+#   name.srt             the subtitles on their own (e.g. for uploading to YouTube)
+#   name.txt             a clean transcript with no timestamps
+#
+# Engine: whisper.cpp (large-v3-turbo, q8_0) on the GPU via Vulkan, falling back to the CPU.
+
+set -uo pipefail
+
+VERSION=2.2.0
+
+# Bundled files, relative to this script (AppDir/usr/bin/whisper-subs).
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+ROOT=$(cd "$HERE/../.." && pwd)
+ENGINE=$ROOT/usr/lib/whisper-subs/engine/whisper-cli
+FFMPEG=$ROOT/usr/lib/whisper-subs/ffmpeg
+FFPROBE=$ROOT/usr/lib/whisper-subs/ffprobe
+MODEL=$ROOT/usr/share/whisper-subs/models/ggml-large-v3-turbo-q8_0.bin
+VAD_MODEL=$ROOT/usr/share/whisper-subs/models/ggml-silero-v6.2.0.bin
+
+# Style prompt for English (see the whisper-cli call). Exactly 16 tokens; if it's changed, -mc
+# there must become its new token count + 1.
+STYLE_PROMPT="Hello, and welcome. In this lecture, we'll look at some examples."
+
+# Defaults (see --help).
+language=en
+use_vad=1  # skip silence/music: stops Whisper inventing text there and fixes start times
+use_gpu=1
+
+# Character counts below assume a UTF-8 locale; fall back to C.UTF-8 if the current one isn't.
+if [[ $(locale charmap 2>/dev/null) != UTF-8 ]]; then
+    export LC_ALL=C.UTF-8
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Output helpers. Colors and the live progress bar only when writing to a terminal.
+
+tty=0
+c_reset='' c_bold='' c_dim='' c_cyan='' c_green='' c_yellow='' c_red=''
+if [[ -t 1 ]]; then
+    tty=1
+    if [[ -z ${NO_COLOR:-} ]]; then
+        c_reset=$'\e[0m' c_bold=$'\e[1m' c_dim=$'\e[90m' c_cyan=$'\e[36m'
+        c_green=$'\e[32m' c_yellow=$'\e[33m' c_red=$'\e[31m'
+    fi
+fi
+
+ok()   { echo "  ${c_green}✓${c_reset} $*"; }
+warn() { echo "  ${c_yellow}!${c_reset} $*" >&2; }
+err()  { echo "  ${c_red}✗ $*${c_reset}" >&2; }
+die()  { echo "${c_red}whisper-subs: $*${c_reset}" >&2; exit 1; }
+
+# Microseconds since the epoch (EPOCHREALTIME uses the locale's decimal separator).
+now_us() { echo "${EPOCHREALTIME//[.,]/}"; }
+
+# The *_r helpers set REPLY instead of printing, so the progress loop (once per segment) can
+# call them without a subshell each time.
+
+# Milliseconds -> "1h 02m 05s" / "2m 05s" / "45s"
+fmt_time_r() {
+    local t=$(( ($1 + 500) / 1000 ))
+    local h=$(( t / 3600 )) m=$(( t / 60 % 60 )) s=$(( t % 60 ))
+    if (( h > 0 )); then printf -v REPLY '%dh %02dm %02ds' $h $m $s
+    elif (( m > 0 )); then printf -v REPLY '%dm %02ds' $m $s
+    else printf -v REPLY '%ds' $s
+    fi
+}
+fmt_time() { fmt_time_r "$1"; printf '%s' "$REPLY"; }
+
+# Milliseconds -> "1:02:05" / "2:05"
+fmt_clock_r() {
+    local t=$(( $1 / 1000 ))
+    local h=$(( t / 3600 )) m=$(( t / 60 % 60 )) s=$(( t % 60 ))
+    if (( h > 0 )); then printf -v REPLY '%d:%02d:%02d' $h $m $s
+    else printf -v REPLY '%d:%02d' $m $s
+    fi
+}
+fmt_clock() { fmt_clock_r "$1"; printf '%s' "$REPLY"; }
+
+# "872.025397" (seconds) -> 872025 (milliseconds); empty if not a number.
+secs_to_ms() {
+    [[ $1 =~ ^([0-9]+)(\.([0-9]*))?$ ]] || return
+    local frac="${BASH_REMATCH[3]}000"
+    echo $(( 10#${BASH_REMATCH[1]} * 1000 + 10#${frac:0:3} ))
+}
+
+# "HH:MM:SS.mmm" -> milliseconds
+ts_to_ms_r() {
+    [[ $1 =~ ^([0-9]+):([0-9]+):([0-9]+)[.,]([0-9]+)$ ]] || { REPLY=0; return; }
+    REPLY=$(( 10#${BASH_REMATCH[1]} * 3600000 + 10#${BASH_REMATCH[2]} * 60000 + 10#${BASH_REMATCH[3]} * 1000 + 10#${BASH_REMATCH[4]} ))
+}
+ts_to_ms() { ts_to_ms_r "$1"; echo "$REPLY"; }
+
+# Truncate to at most $2 characters, ending with "…" if cut.
+shorten_r() {
+    local s=$1 max=$2
+    if (( ${#s} <= max )); then REPLY=$s
+    elif (( max <= 1 )); then REPLY='…'
+    else REPLY="${s:0:max-1}…"
+    fi
+}
+shorten() { shorten_r "$1" "$2"; printf '%s' "$REPLY"; }
+
+term_cols=80
+update_cols() {
+    local size
+    size=$(stty size < /dev/tty 2>/dev/null) && term_cols=${size#* }
+    [[ $term_cols =~ ^[0-9]+$ ]] && (( term_cols > 0 )) || term_cols=80
+}
+
+# ---------------------------------------------------------------------------------------------
+# Drag-and-drop: turn whatever the terminal pasted into paths. Terminals differ: some paste raw
+# paths, some quote or backslash-escape them, some paste file:// URIs.
+
+tokenize() {  # shell-style split: '...' "..." and backslash escapes; prints NUL-separated words
+    local s=$1 i c q='' word='' have=0
+    for (( i = 0; i < ${#s}; i++ )); do
+        c=${s:i:1}
+        if [[ $q == "'" ]]; then
+            if [[ $c == "'" ]]; then q=''; else word+=$c; fi
+        elif [[ $q == '"' ]]; then
+            if [[ $c == '"' ]]; then q=''
+            elif [[ $c == '\' && ${s:i+1:1} == [\"\\\$\`] ]]; then word+=${s:i+1:1}; (( i++ ))
+            else word+=$c
+            fi
+        elif [[ $c == '\' ]]; then word+=${s:i+1:1}; (( i++ )); have=1
+        elif [[ $c == "'" || $c == '"' ]]; then q=$c; have=1
+        elif [[ $c == [[:space:]] ]]; then
+            (( have )) && printf '%s\0' "$word"
+            word='' have=0
+        else word+=$c; have=1
+        fi
+    done
+    (( have )) && printf '%s\0' "$word"
+}
+
+url_decode() { local s=${1//+/%2B}; printf '%b' "${s//%/\\x}"; }
+
+parse_dropped() {  # prints NUL-separated paths
+    local raw=$1 t
+    raw=${raw#"${raw%%[![:space:]]*}"}; raw=${raw%"${raw##*[![:space:]]}"}
+    if [[ -f $raw ]]; then printf '%s\0' "$raw"; return; fi
+    while IFS= read -r -d '' t; do
+        [[ $t == file://* ]] && t=$(url_decode "${t#file://}")
+        [[ $t == "~" || $t == "~/"* ]] && t=$HOME${t:1}
+        printf '%s\0' "$t"
+    done < <(tokenize "$raw")
+}
+
+# ---------------------------------------------------------------------------------------------
+# Progress bar: reads whisper-cli's segment lines ("[00:00:12.340 --> 00:00:15.000]  text") on
+# stdin and redraws one row. Args: video duration in ms (may be empty), start time in µs.
+
+progress() {
+    local duration=$1 start=$2 line pos elapsed pct info eta width filled bar preview room text dur_clock n=0 recent=''
+    if (( ! tty )); then cat > /dev/null; return; fi
+    update_cols
+    shorten_r 'Transcribing (the first update comes after ~30 s of audio)…' $(( term_cols - 3 ))
+    printf '  %s%s%s' "$c_dim" "$REPLY" "$c_reset"
+    [[ -n $duration ]] && { fmt_clock_r "$duration"; dur_clock=$REPLY; }
+    while IFS= read -r line; do
+        [[ $line =~ ^\[([0-9:.]+)\ --\>\ ([0-9:.]+)\]\ *(.*)$ ]] || continue
+        text=${BASH_REMATCH[3]}
+        # whisper-cli reports one word per line (-ml 1): keep a rolling tail of recent words.
+        recent+=" ${text#"${text%%[![:space:]]*}"}"
+        (( ${#recent} > 300 )) && recent=${recent: -300}
+        ts_to_ms_r "${BASH_REMATCH[2]}"; pos=$REPLY
+        elapsed=$(( (${EPOCHREALTIME//[.,]/} - start) / 1000 ))
+        (( n++ % 5 == 0 )) && update_cols  # picks up terminal resizes
+
+        if [[ -n $duration ]] && (( duration > 0 )); then
+            (( pos > duration )) && pos=$duration
+            pct=$(( pos * 100 / duration ))
+            fmt_clock_r "$pos"
+            printf -v info '%3d%%  %s / %s' $pct "$REPLY" "$dur_clock"
+            eta=''
+            if (( pct >= 3 && pos > 0 )); then
+                fmt_time_r $(( elapsed * (duration - pos) / pos )); eta="  ETA $REPLY"
+            fi
+            # Fit the row to the terminal: shrink the bar, then drop the ETA, then the bar.
+            width=$(( term_cols - 5 - ${#info} - ${#eta} ))
+            if (( width < 6 )); then eta=''; width=$(( term_cols - 5 - ${#info} )); fi
+            (( width > 24 )) && width=24
+            if (( width >= 6 )); then
+                filled=$(( pos * width / duration ))
+                printf -v bar '%*s' $filled ''; bar=${bar// /█}
+                printf -v preview '%*s' $(( width - filled )) ''; preview=${preview// /░}
+                bar="$c_cyan$bar$c_dim$preview$c_reset  $info$eta"
+                room=$(( term_cols - 2 - width - 2 - ${#info} - ${#eta} - 3 ))
+            else
+                info=${info#"${info%%[![:space:]]*}"}
+                shorten_r "$info" $(( term_cols - 3 )); bar=$REPLY
+                room=$(( term_cols - 2 - ${#bar} - 3 ))
+            fi
+        else
+            fmt_clock_r "$pos"; info=$REPLY
+            fmt_time_r "$elapsed"
+            shorten_r "$info  elapsed $REPLY" $(( term_cols - 3 )); bar=$REPLY
+            room=$(( term_cols - 2 - ${#bar} - 3 ))
+        fi
+
+        # The latest words in whatever room is left (halved for wide CJK characters).
+        preview=''
+        [[ $recent == *[![:ascii:]]* ]] && room=$(( room / 2 ))
+        if (( room > 12 )); then
+            if (( ${#recent} > room )); then preview="…${recent: -$(( room - 1 ))}"; else preview=${recent# }; fi
+            preview="  $c_dim$preview$c_reset"
+        fi
+        printf '\r\e[2K  %s%s' "$bar" "$preview"
+    done
+    printf '\r\e[2K'
+}
+
+# ---------------------------------------------------------------------------------------------
+# SRT post-processing (POSIX awk, works with mawk/gawk/busybox):
+# 1. Rewrites the SRT, dropping cues with no text and capping cues at `limit` seconds (a final
+#    cue can run past the end of the video, which would stretch an mkv's length).
+# 2. Writes a clean transcript: cue text joined into paragraphs, breaking at pauses of PAUSE
+#    seconds or more, or at a sentence end once a paragraph is MAX_PARA characters long.
+
+read -r -d '' POSTPROCESS_AWK <<'AWK'
+function secs(t,   p, n) {
+    gsub(/,/, ".", t); gsub(/[ \t]/, "", t)
+    n = split(t, p, ":")
+    if (n == 3) return p[1] * 3600 + p[2] * 60 + p[3]
+    if (n == 2) return p[1] * 60 + p[2]
+    return t + 0
+}
+function fmt(x,   ms) {
+    ms = int(x * 1000 + 0.5)
+    return sprintf("%02d:%02d:%02d,%03d", int(ms / 3600000), int(ms / 60000) % 60, int(ms / 1000) % 60, ms % 1000)
+}
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function add_text(s) {
+    s = trim(s)
+    if (s == "" || n == 0) return
+    text[n] = (text[n] == "") ? s : text[n] "\n" s
+}
+BEGIN { PAUSE = 2.0; MAX_PARA = 600; has_limit = (limit != ""); lim = limit + 0 }
+{
+    sub(/\r$/, "")
+    if (held) {
+        held = 0
+        if ($0 ~ /-->/) {  # index line + timestamp line: a new cue
+            n++
+            split($0, ts, /-->/)
+            e = ts[2]; sub(/^[ \t]+/, "", e); sub(/[ \t].*$/, "", e)
+            start[n] = secs(ts[1]); stop[n] = secs(e); text[n] = ""
+            next
+        }
+        add_text(held_line)  # the number was cue text after all
+    }
+    if ($0 ~ /^[ \t]*[0-9]+[ \t]*$/) { held = 1; held_line = $0; next }
+    add_text($0)
+}
+END {
+    if (held) add_text(held_line)
+    printf "" > srt_out
+    printf "" > txt_out
+    out = 0
+    for (i = 1; i <= n; i++) {
+        if (text[i] == "") continue
+        s = start[i]; e = stop[i]
+        if (has_limit) { if (s >= lim) continue; if (e > lim) e = lim }
+        out++; S[out] = s; E[out] = e; T[out] = text[i]
+    }
+    for (i = 1; i <= out; i++) printf "%d\n%s --> %s\n%s\n\n", i, fmt(S[i]), fmt(E[i]), T[i] > srt_out
+    para = ""; np = 0
+    for (i = 1; i <= out; i++) {
+        line = T[i]; gsub(/\n/, " ", line)
+        if (para != "" && (S[i] - prev_end >= PAUSE || (length(para) >= MAX_PARA && para ~ /[.?!]$/))) {
+            printf "%s%s", (np++ ? "\n\n" : ""), para > txt_out
+            para = ""
+        }
+        para = (para == "") ? line : para " " line
+        prev_end = E[i]
+    }
+    if (para != "") printf "%s%s", (np++ ? "\n\n" : ""), para > txt_out
+    if (np) printf "\n" > txt_out
+}
+AWK
+
+postprocess() {  # srt txt [limit_seconds]
+    local srt=$1 txt=$2 limit=${3:-}
+    awk -v srt_out="$srt.tmp" -v txt_out="$txt" -v limit="$limit" "$POSTPROCESS_AWK" "$srt" \
+        && mv -f -- "$srt.tmp" "$srt"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Subtitle layout (POSIX awk). whisper-cli writes one word per cue (-ml 1 -sow), with timings;
+# this groups them into readable cues: sentences (split at sentence ends and pauses) of up to MAX
+# characters; longer sentences split into evenly sized pieces, preferring breaks after commas
+# (so no one-word leftovers); cues short in text or on screen merged into a neighbour; cues stay
+# up LINGER after the last word, at least MIN_DUR, without flickering gaps or overlaps.
+# (whisper.cpp's own -ml 84 splitting filled each cue greedily and left the last word of a long
+# sentence on its own for a fraction of a second: 42% of cues on fast speech.)
+
+read -r -d '' REGROUP_AWK <<'AWK'
+function secs(t,   p, n) {
+    gsub(/,/, ".", t); gsub(/[ \t]/, "", t)
+    n = split(t, p, ":")
+    if (n == 3) return p[1] * 3600 + p[2] * 60 + p[3]
+    if (n == 2) return p[1] * 60 + p[2]
+    return t + 0
+}
+function fmt(x,   ms) {
+    ms = int(x * 1000 + 0.5)
+    return sprintf("%02d:%02d:%02d,%03d", int(ms / 3600000), int(ms / 60000) % 60, int(ms / 1000) % 60, ms % 1000)
+}
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function add_word(s) {
+    s = trim(s)
+    if (s == "" || n == 0) return
+    text[n] = (text[n] == "") ? s : text[n] " " s
+}
+function emit(a, b) { nc++; CA[nc] = a; CB[nc] = b }
+function cue_len(a, b,   i, L) { L = 0; for (i = a; i <= b; i++) L += (i > a) + length(W[i]); return L }
+function abs(x) { return x < 0 ? -x : x }
+BEGIN { MAX = 84; PAUSE = 0.8; SHORT = 20; MERGE_GAP = 1.0; MIN_DUR = 1.0; GAP_CLOSE = 0.4; LINGER = 0.6 }
+{
+    sub(/\r$/, "")
+    if (held) {
+        held = 0
+        if ($0 ~ /-->/) {
+            n++
+            split($0, ts, /-->/)
+            e = ts[2]; sub(/^[ \t]+/, "", e); sub(/[ \t].*$/, "", e)
+            start[n] = secs(ts[1]); stop[n] = secs(e); text[n] = ""
+            next
+        }
+        add_word(held_line)
+    }
+    if ($0 ~ /^[ \t]*[0-9]+[ \t]*$/) { held = 1; held_line = $0; next }
+    add_word($0)
+}
+END {
+    if (held) add_word(held_line)
+    nw = 0  # words, skipping empty cues
+    for (i = 1; i <= n; i++) if (text[i] != "") { nw++; W[nw] = text[i]; S[nw] = start[i]; E[nw] = stop[i] }
+
+    # 1. Sentences: break after sentence-ending punctuation or before a pause.
+    ns = 0; a = 1
+    for (i = 1; i <= nw; i++)
+        if (i == nw || W[i] ~ /[.?!]["')\]]*$/ || S[i + 1] - E[i] >= PAUSE) { ns++; SA[ns] = a; SB[ns] = i; a = i + 1 }
+
+    # 2. Long sentences -> evenly sized pieces of at most MAX characters.
+    nc = 0
+    for (s = 1; s <= ns; s++) {
+        a = SA[s]; b = SB[s]
+        L = 0
+        for (i = a; i <= b; i++) { L += (i > a) + length(W[i]); pos[i] = L }
+        st = a
+        while (1) {
+            base = (st > a) ? pos[st - 1] + 1 : 0
+            rem = pos[b] - base
+            if (rem <= MAX) { emit(st, b); break }
+            k = int((rem + MAX - 1) / MAX)
+            target = base + rem / k
+            best = -1; bestscore = 1e9
+            for (i = st; i < b; i++) {
+                if (pos[i] - base > MAX) break
+                score = abs(pos[i] - target) - (W[i] ~ /[,;:]["')\]]*$/ ? 12 : 0)
+                if (score < bestscore) { bestscore = score; best = i }
+            }
+            if (best < 0) best = st  # a single "word" longer than MAX
+            emit(st, best); st = best + 1
+        }
+    }
+
+    # 3. Merge cues that are short in text (e.g. "Right.") or on screen (the next cue starts within
+    #    MIN_DUR) into the next cue, or else the previous one, if the result still fits and they're
+    #    close in time.
+    m = 0
+    for (c = 1; c <= nc; c++) {
+        a = CA[c]; b = CB[c]
+        if (cue_len(a, b) < SHORT || b - a < 1 || (c < nc && S[CA[c + 1]] - S[a] < MIN_DUR)) {
+            if (c < nc && S[CA[c + 1]] - E[b] <= MERGE_GAP && cue_len(a, CB[c + 1]) <= MAX) { CA[c + 1] = a; continue }
+            if (m > 0 && S[a] - E[MB[m]] <= MERGE_GAP && cue_len(MA[m], b) <= MAX) { MB[m] = b; continue }
+        }
+        m++; MA[m] = a; MB[m] = b
+    }
+
+    # 4. Timing: stay up LINGER after the last word (time to finish reading), close small gaps,
+    #    at least MIN_DUR on screen, never overlapping the next cue.
+    for (c = 1; c <= m; c++) {
+        t0 = S[MA[c]]; t1 = E[MB[c]] + LINGER
+        if (c < m) {
+            nxt = S[MA[c + 1]]
+            if (nxt - t1 < GAP_CLOSE) t1 = nxt
+            if (t1 - t0 < MIN_DUR) t1 = (t0 + MIN_DUR < nxt) ? t0 + MIN_DUR : nxt
+            if (t1 > nxt) t1 = nxt
+        } else if (t1 - t0 < MIN_DUR) t1 = t0 + MIN_DUR
+        if (t1 <= t0) t1 = t0 + 0.001
+        line = W[MA[c]]
+        for (i = MA[c] + 1; i <= MB[c]; i++) line = line " " W[i]
+        printf "%d\n%s --> %s\n%s\n\n", c, fmt(t0), fmt(t1), line
+    }
+}
+AWK
+
+regroup() {  # srt: word-level cues -> readable cues, in place
+    awk "$REGROUP_AWK" "$1" > "$1.tmp" && mv -f -- "$1.tmp" "$1"
+}
+
+# ISO 639-1 (what Whisper takes) -> ISO 639-2 (what the subtitle track metadata uses).
+language_tag() {
+    case $1 in
+        en) echo eng ;; es) echo spa ;; fr) echo fra ;; de) echo deu ;; it) echo ita ;;
+        pt) echo por ;; nl) echo nld ;; ru) echo rus ;; uk) echo ukr ;; pl) echo pol ;;
+        tr) echo tur ;; sv) echo swe ;; da) echo dan ;; no) echo nor ;; fi) echo fin ;;
+        cs) echo ces ;; el) echo ell ;; he) echo heb ;; ar) echo ara ;; hi) echo hin ;;
+        ja) echo jpn ;; ko) echo kor ;; zh) echo zho ;; vi) echo vie ;; id) echo ind ;;
+        *) echo und ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------------------------
+# --install / --uninstall: put the AppImage on the PATH as ~/.local/bin/whisper-subs.
+
+BIN_DIR=$HOME/.local/bin
+INSTALLED=$BIN_DIR/whisper-subs
+# Without FUSE, the command on the PATH is a small launcher and the AppImage lives here.
+NOFUSE_APPIMAGE=${XDG_DATA_HOME:-$HOME/.local/share}/whisper-subs/whisper-subs.AppImage
+LAUNCHER_MARK='# whisper-subs launcher for systems without FUSE'
+
+is_appimage() {  # AppImage type 2 magic bytes "AI\x02" at offset 8
+    [[ -f $1 ]] && [[ $(od -An -tx1 -j8 -N3 "$1" 2>/dev/null | tr -d ' \n') == 414902 ]]
+}
+is_launcher() { [[ -f $1 ]] && grep -qF "$LAUNCHER_MARK" "$1" 2>/dev/null; }
+
+copy_file() {  # src dest: copy via a temp file so a failed copy never leaves a broken dest
+    cp -f -- "$1" "$2.tmp.$$" && chmod +x -- "$2.tmp.$$" && mv -f -- "$2.tmp.$$" "$2" \
+        || { rm -f -- "$2.tmp.$$"; return 1; }
+}
+
+offer_path_setup() {
+    case ":$PATH:" in *":$BIN_DIR:"*) return ;; esac
+    local shell_name rc line
+    shell_name=$(basename "${SHELL:-bash}")
+    case $shell_name in
+        fish) line="fish_add_path -U $BIN_DIR" ;;
+        zsh)  rc=$HOME/.zshrc;  line="export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+        *)    rc=$HOME/.bashrc; line="export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+    warn "$BIN_DIR is not on your PATH yet, so the 'whisper-subs' command won't be found."
+    if [[ -t 0 ]]; then
+        read -r -p "  Add it for $shell_name now? [Y/n] " answer
+        if [[ ! $answer =~ ^[Nn] ]]; then
+            if [[ $shell_name == fish ]]; then
+                fish -c "fish_add_path -U '$BIN_DIR'" && ok "Added to fish's PATH (takes effect in new terminals)"
+            else
+                printf '\n# Added by whisper-subs --install\n%s\n' "$line" >> "$rc" \
+                    && ok "Added to $rc (takes effect in new terminals)"
+            fi
+            return
+        fi
+    fi
+    echo "  To add it yourself, run:"
+    if [[ $shell_name == fish ]]; then echo "    $line"
+    else echo "    echo '$line' >> $rc"
+    fi
+}
+
+install_self() {
+    local src=${APPIMAGE:-}
+    [[ -n $src && -f $src ]] || die "--install only works when running the AppImage (whisper-subs-*.AppImage)."
+    mkdir -p -- "$BIN_DIR" || die "couldn't create $BIN_DIR"
+    local nofuse=0
+    [[ ${ROOT##*/} == appimage_extracted_* ]] && nofuse=1  # started via --appimage-extract-and-run
+
+    if [[ $(readlink -f -- "$src") == "$(readlink -f -- "$INSTALLED")" ||
+          $(readlink -f -- "$src") == "$(readlink -f -- "$NOFUSE_APPIMAGE")" ]]; then
+        ok "This copy is already the installed one"
+    else
+        if [[ -e $INSTALLED ]] && ! is_appimage "$INSTALLED" && ! is_launcher "$INSTALLED"; then
+            local backup
+            backup=$INSTALLED.backup-$(date +%Y%m%d-%H%M%S)
+            mv -- "$INSTALLED" "$backup" || die "couldn't move the existing $INSTALLED aside"
+            warn "Your previous whisper-subs (not this AppImage) was kept as $backup"
+        fi
+        if (( nofuse )); then
+            # No FUSE here, so the AppImage can't mount itself: install a launcher that always
+            # runs it in extract mode (it unpacks to a temporary folder first, then cleans up).
+            mkdir -p -- "${NOFUSE_APPIMAGE%/*}" && copy_file "$src" "$NOFUSE_APPIMAGE" \
+                || die "couldn't copy to $NOFUSE_APPIMAGE"
+            printf '#!/bin/sh\n%s (installed by whisper-subs --install)\nAPPIMAGE_EXTRACT_AND_RUN=1 exec "%s" "$@"\n' \
+                "$LAUNCHER_MARK" "$NOFUSE_APPIMAGE" > "$INSTALLED.tmp.$$" && chmod +x -- "$INSTALLED.tmp.$$" \
+                && mv -f -- "$INSTALLED.tmp.$$" "$INSTALLED" || die "couldn't write $INSTALLED"
+            ok "Installed whisper-subs $VERSION to $INSTALLED"
+            warn "FUSE isn't available here, so each run unpacks itself first (a few seconds slower)."
+            echo "    Installing fuse3 (e.g. 'sudo apt install fuse3') and running --install again avoids that."
+        else
+            copy_file "$src" "$INSTALLED" || die "couldn't copy to $INSTALLED"
+            rm -f -- "$NOFUSE_APPIMAGE"  # from an earlier no-FUSE install, if any
+            ok "Installed whisper-subs $VERSION to $INSTALLED"
+        fi
+    fi
+    offer_path_setup
+    echo "  Run ${c_bold}whisper-subs${c_reset} from any terminal. Remove it with ${c_bold}whisper-subs --uninstall${c_reset}."
+}
+
+uninstall_self() {
+    if [[ ! -e $INSTALLED ]]; then
+        ok "Nothing to remove: $INSTALLED doesn't exist"
+    elif is_appimage "$INSTALLED" || is_launcher "$INSTALLED"; then
+        rm -f -- "$INSTALLED" "$NOFUSE_APPIMAGE" && ok "Removed $INSTALLED"
+        rmdir -- "${NOFUSE_APPIMAGE%/*}" 2>/dev/null
+    else
+        die "$INSTALLED isn't a whisper-subs AppImage; not removing it."
+    fi
+}
+
+usage() {
+    cat <<EOF
+whisper-subs $VERSION — subtitles and transcripts for videos, made with Whisper
+
+Usage:
+  whisper-subs [options] VIDEO...
+  whisper-subs [options]            then drag video file(s) into the terminal and press Enter
+  whisper-subs --channel URL [options]
+
+For each video, a folder "NAME (subtitled)" is created next to it containing:
+  NAME.subtitled.mp4   the video with a subtitle track (non-mp4/mov inputs become .mkv)
+  NAME.srt             the subtitles on their own (e.g. to upload to YouTube)
+  NAME.txt             a clean transcript
+  NAME.mp4             the original video, moved in once everything succeeds
+
+Re-running only fills in what's missing: existing subtitles are reused (no second
+transcription), so e.g. a --subs-only run can later be completed with the videos.
+
+Options:
+      --subs-only      make only the .srt and .txt (no subtitled video)
+      --force          redo everything, including transcription
+  -l, --language CODE  spoken language, e.g. en, es, fr, de, or "auto" (default: en)
+      --no-vad         transcribe silence/music too (by default they're skipped, which stops
+                       Whisper inventing text like "Thank you." there)
+      --cpu            don't use the GPU
+
+YouTube (needs yt-dlp installed):
+  -c, --channel SOURCE process every video from SOURCE, one at a time: download (best quality
+                       up to 720p; audio only with --subs-only), transcribe, and keep only the
+                       outputs. SOURCE is a channel (its Videos tab), a playlist, a single
+                       video, or a text file of such links, one per line (# for comments).
+                       Repeat -c for several sources; a video listed twice is done once.
+                       Unlisted videos work through playlists or direct links.
+                       Folders are named "DATE TITLE [VIDEO_ID] (subtitled)"; re-running skips
+                       finished videos and fills in missing parts, so it also picks up new
+                       uploads.
+  -o, --output DIR     where the videos' folders go (default: current folder)
+      --limit N        only the newest N videos of each channel or playlist
+
+Installing:
+      --install        copy this AppImage to ~/.local/bin/whisper-subs so it runs from anywhere
+      --uninstall      remove ~/.local/bin/whisper-subs
+  -V, --version        show version information
+  -h, --help           show this help
+
+If the AppImage won't start with a "fusermount"/FUSE error (common in containers), add
+--appimage-extract-and-run before the other options, e.g.:
+  ./whisper-subs-$VERSION-x86_64.AppImage --appimage-extract-and-run --install
+EOF
+}
+
+version() {
+    echo "whisper-subs $VERSION"
+    # Component versions are recorded at packaging time.
+    [[ -f $ROOT/usr/share/whisper-subs/versions.txt ]] && sed 's/^/  /' "$ROOT/usr/share/whisper-subs/versions.txt"
+}
+
+# A YouTube title as a tidy file name: plain stand-ins for characters that aren't allowed (or
+# are awkward to type) in file names -- "Logic 101: Premises | Notes" -> "Logic 101 - Premises -
+# Notes" -- then cut to at most 80 characters at a word boundary.
+clean_title() {
+    local t=$1
+    t=${t//[$'\t\r\n']/ }
+    t=${t//[:：|｜]/ - }
+    t=${t//[\/⧸\\⧹]/-}
+    t=${t//[\"＂“”]/\'}
+    t=${t//[?？*＊<＜>＞]/}
+    while [[ $t == *'  '* ]]; do t=${t//  / }; done
+    while [[ $t == *'- -'* ]]; do t=${t//- -/-}; done
+    if (( ${#t} > 80 )); then
+        t=${t:0:80}
+        [[ $t == *' '* ]] && t=${t% *}
+    fi
+    while [[ $t =~ [[:space:].,\;-]$ ]]; do t=${t%?}; done
+    while [[ $t =~ ^[[:space:].-] ]]; do t=${t#?}; done
+    printf '%s' "${t:-video}"
+}
+
+# Sourced (by tests) for the functions above: stop before doing anything.
+[[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
+
+# ---------------------------------------------------------------------------------------------
+# Cleanup on exit (set up first so it also covers --help/--version).
+
+work=''         # temporary folder for the extracted audio and logs
+partial=''      # output file ffmpeg is writing
+cur_dir=''      # output folder of the current video
+cur_created=0   # whether this run created it
+stage=''        # --channel: folder of the in-progress download
+
+cleanup() {
+    [[ -n $work ]] && rm -rf -- "$work"
+    [[ -n $partial ]] && rm -f -- "$partial"
+    (( cur_created )) && rmdir -- "$cur_dir" 2>/dev/null  # only succeeds if nothing was written
+    [[ -n $stage ]] && rm -rf -- "$stage"
+    # Without FUSE, the AppImage runtime (--appimage-extract-and-run) unpacks everything (~1 GB)
+    # into $TMPDIR/appimage_extracted_* and never deletes it, and /tmp is often in RAM.
+    if [[ -n ${APPIMAGE:-} && ${ROOT##*/} == appimage_extracted_* && -x $ROOT/usr/bin/whisper-subs ]]; then
+        rm -rf -- "$ROOT"
+    fi
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------------------------
+# Arguments
+
+subs_only=0     # --subs-only: .srt + .txt, no subtitled video
+force=0         # --force: redo everything instead of filling in what's missing
+channel_sources=()  # --channel URL|FILE (repeatable)
+out_root=''     # --output DIR (channel mode)
+limit=0         # --limit N (channel mode: newest N videos)
+
+inputs=()
+while (( $# )); do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        -V|--version) version; exit 0 ;;
+        --install) install_self; exit 0 ;;
+        --uninstall) uninstall_self; exit 0 ;;
+        -l|--language) [[ -n ${2:-} ]] || die "$1 needs a language code (e.g. en)"; language=$2; shift ;;
+        --language=*) language=${1#*=} ;;
+        --no-vad) use_vad=0 ;;
+        --cpu) use_gpu=0 ;;
+        --subs-only) subs_only=1 ;;
+        --force) force=1 ;;
+        -c|--channel) [[ -n ${2:-} ]] || die "$1 needs a YouTube URL or a file of URLs"; channel_sources+=("$2"); shift ;;
+        --channel=*) channel_sources+=("${1#*=}") ;;
+        -o|--output) [[ -n ${2:-} ]] || die "$1 needs a folder"; out_root=$2; shift ;;
+        --output=*) out_root=${1#*=} ;;
+        --limit) [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "$1 needs a positive number"; limit=$2; shift ;;
+        --limit=*) limit=${1#*=}; [[ $limit =~ ^[1-9][0-9]*$ ]] || die "--limit needs a positive number" ;;
+        --) shift; inputs+=("$@"); break ;;
+        -*) [[ -e $1 ]] && inputs+=("$1") || die "unknown option $1 (see --help)" ;;
+        *) inputs+=("$1") ;;
+    esac
+    shift
+done
+
+if (( ${#channel_sources[@]} )); then
+    (( ${#inputs[@]} == 0 )) || die "--channel downloads its own videos; don't also give files"
+else
+    [[ -z $out_root ]] || die "--output is for --channel (local videos get a folder next to them)"
+    (( limit == 0 )) || die "--limit is for --channel"
+fi
+
+for f in "$ENGINE" "$FFMPEG" "$FFPROBE"; do
+    [[ -x $f ]] || die "bundled program missing: $f"
+done
+for f in "$MODEL" "$VAD_MODEL"; do
+    [[ -f $f ]] || die "bundled model missing: $f"
+done
+
+# ---------------------------------------------------------------------------------------------
+# Ctrl-C stops the whole batch (whisper-cli/ffmpeg/yt-dlp get the same signal); cleanup() runs
+# on exit.
+
+# The extracted audio is ~115 MB per hour of video, so keep it on disk rather than in /tmp
+# (RAM-backed on many systems).
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/whisper-subs
+mkdir -p -- "$cache" 2>/dev/null && [[ -w $cache ]] || cache=${TMPDIR:-/tmp}
+work=$(mktemp -d -p "$cache" whisper-subs.XXXXXX) || die "couldn't create a temporary folder"
+log=$work/log
+trap '(( tty )) && printf "\r\e[2K"; echo; err "Interrupted"; exit 130' INT
+# (No WINCH trap for resizes: a trapped signal makes `read` in the progress loop return early,
+# which would close the pipe and kill whisper-cli. The bar re-reads the width on every update.)
+
+threads=$(nproc 2>/dev/null || echo 4)
+(( threads > 8 )) && threads=8
+lang_tag=$(language_tag "$language")
+[[ $language == en ]] && track_title="English (Whisper)" || track_title="$language (Whisper)"
+
+# ---------------------------------------------------------------------------------------------
+# One video: produce whatever is missing from its "NAME (subtitled)" folder.
+#   subtitles (.srt)      transcribed only if missing (or --force): the slow part
+#   transcript (.txt)     rebuilt from the .srt if missing
+#   subtitled video       made from the video + .srt if missing (skipped with --subs-only)
+# Args: path, keep_original (1: move it into the folder; 0: delete it, e.g. a downloaded
+# audio-only file). Returns 0 done, 1 failed, 2 nothing to do.
+
+process_video() {
+    local video=$1 keep_original=$2
+    local filename src_dir name ext base src_dir_name out_dir srt txt out_ext sub_codec out f fname suffix
+    local have_srt=0 have_txt=0 have_out=0 need_transcribe need_txt need_mux existing_out=''
+    local video_start duration wav whisper_status device on tag title detected sub_index elapsed speed timing
+    local original_display limit_s transcribed=0
+    filename=${video##*/}
+
+    if [[ ! -f $video ]]; then err "Not a file: $video"; return 1; fi
+    if ! "$FFPROBE" -v error -select_streams a -show_entries stream=index -of csv=p=0 -- "$video" 2>/dev/null \
+            | grep -qE '^[0-9]+$'; then
+        err "No audio track to transcribe"; return 1
+    fi
+
+    src_dir=${video%/*}; [[ -z $src_dir ]] && src_dir=/
+    name=${filename%.*}
+    if [[ -z $name || $name == "$filename" ]]; then name=$filename; ext=''  # ".hidden", "noext"
+    else ext=${filename##*.}; ext=${ext,,}
+    fi
+    base=$src_dir/$name
+
+    src_dir_name=${src_dir##*/}
+    if [[ $src_dir_name == "$name (subtitled)" || $src_dir_name == "$filename (subtitled)" ]]; then
+        out_dir=$src_dir  # already inside its output folder (e.g. re-running): reuse it
+    else
+        out_dir="$base (subtitled)"
+        # A different video with the same name (e.g. clip.mp4 vs clip.mkv) may already own that
+        # folder; give this one its own so their .srt/.txt don't overwrite each other.
+        for f in "$out_dir/$name".*; do
+            [[ -f $f ]] || continue
+            fname=${f##*/}; suffix=${fname:${#name}+1}
+            if [[ $fname != "$filename" && $suffix != srt && $suffix != txt && $suffix != subtitled.* ]]; then
+                out_dir="$video (subtitled)"
+                break
+            fi
+        done
+    fi
+    srt=$out_dir/$name.srt
+    txt=$out_dir/$name.txt
+
+    # mp4/mov only support mov_text subtitles; everything else goes into mkv with srt.
+    case $ext in
+        mp4|m4v|mov) out_ext=$ext; sub_codec=mov_text ;;
+        *) out_ext=mkv; sub_codec=srt ;;
+    esac
+    out=$out_dir/$name.subtitled.$out_ext
+
+    # What's already there, and so what's left to do.
+    [[ -s $srt ]] && have_srt=1
+    [[ -s $txt ]] && have_txt=1
+    for f in "$out_dir/$name".subtitled.*; do
+        [[ -f $f ]] && { have_out=1; existing_out=$f; break; }
+    done
+    need_transcribe=$(( force || ! have_srt ))
+    need_txt=$(( need_transcribe || ! have_txt ))
+    need_mux=$(( ! subs_only && (force || need_transcribe || ! have_out) ))
+    if (( ! need_transcribe && ! need_txt && ! need_mux )); then
+        if (( subs_only )); then ok "Nothing to do: subtitles and transcript already exist ${c_dim}(--force redoes them)$c_reset"
+        else ok "Nothing to do: subtitles, transcript and subtitled video already exist ${c_dim}(--force redoes them)$c_reset"
+        fi
+        (( keep_original )) || rm -f -- "$video"
+        return 2
+    fi
+
+    cur_dir=$out_dir; cur_created=0
+    if [[ ! -d $out_dir ]]; then
+        mkdir -p -- "$out_dir" || { err "Couldn't create $out_dir"; return 1; }
+        cur_created=1
+    fi
+
+    video_start=$(now_us)
+    # Empty if the container doesn't record a duration (ffprobe prints "N/A").
+    duration=$(secs_to_ms "$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 -- "$video" 2>/dev/null)")
+    limit_s=${duration:+$(( duration / 1000 )).$(printf '%03d' $(( duration % 1000 )))}
+
+    if (( need_transcribe )); then
+        (( tty )) && printf '  %sExtracting audio…%s' "$c_dim" "$c_reset"
+        wav=$work/audio.wav
+        "$FFMPEG" -nostdin -v error -y -i "$video" -vn -ar 16000 -ac 1 -c:a pcm_s16le "$wav" 2> "$log"
+        local ffmpeg_status=$?
+        (( tty )) && printf '\r\e[2K'
+        if (( ffmpeg_status != 0 )); then
+            err "Couldn't read the audio"
+            tail -n 5 "$log" | sed 's/^/    /' >&2
+            (( cur_created )) && rmdir -- "$out_dir" 2>/dev/null
+            return 1
+        fi
+
+        # whisper-cli's stdout feeds the progress bar; stderr goes to a log shown only on failure.
+        local whisper_args=(-m "$MODEL" -f "$wav" -l "$language" -t "$threads" -osrt -of "$out_dir/$name")
+        # Never carry transcribed text from one 30 s window into the next: a slip (dropped
+        # punctuation, a repetition loop) would persist for the rest of the video. Without any
+        # context, though, some windows come out lowercase and unpunctuated, so for English every
+        # window gets the same punctuated style prompt instead, and -mc is set to exactly the
+        # prompt's 16 tokens + 1 so no rolling text fits. (Tested on lectures: no unpunctuated
+        # stretches, vs ~15% of words without it. Other languages skip the English prompt.)
+        if [[ $language == en ]]; then
+            whisper_args+=(--prompt "$STYLE_PROMPT" --carry-initial-prompt -mc 17)
+        else
+            whisper_args+=(-mc 0)
+        fi
+        # One word per cue, with timings; regroup() then lays them out as readable subtitles.
+        whisper_args+=(-ml 1 -sow)
+        (( use_vad )) && whisper_args+=(--vad -vm "$VAD_MODEL")
+        (( use_gpu )) || whisper_args+=(-ng)
+        rm -f -- "$srt"
+        "$ENGINE" "${whisper_args[@]}" 2> "$log" | progress "$duration" "$video_start"
+        whisper_status=${PIPESTATUS[0]}
+        rm -f -- "$wav"
+
+        if (( whisper_status != 0 )) || [[ ! -s $srt ]]; then
+            if (( whisper_status != 0 )); then
+                err "Whisper failed"
+                tail -n 5 "$log" | sed 's/^/    /' >&2
+            else
+                err "No speech found"
+            fi
+            # Don't leave behind an empty folder (or the empty .srt written when there's no speech).
+            if (( cur_created )); then
+                [[ -f $srt ]] && ! grep -q '[^[:space:]]' "$srt" && rm -f -- "$srt"
+                rmdir -- "$out_dir" 2>/dev/null
+            fi
+            return 1
+        fi
+        transcribed=1
+        if ! regroup "$srt" 2> "$work/awk.log"; then
+            err "Couldn't lay out the subtitles"
+            tail -n 3 "$work/awk.log" | sed 's/^/    /' >&2
+            rm -f -- "$srt" "$srt.tmp"
+            (( cur_created )) && rmdir -- "$out_dir" 2>/dev/null
+            return 1
+        fi
+
+        device=$(sed -n 's/^ggml_vulkan: 0 = \([^(|]*\).*/\1/p' "$log" | head -1 | sed 's/ *$//')
+        if grep -q 'using Vulkan0 backend' "$log" && [[ -n $device ]]; then
+            on="on $device"
+        else
+            on="on the CPU"
+            (( use_gpu )) && on+=" ${c_dim}(no usable Vulkan GPU found)$c_reset"
+        fi
+        ok "Transcribed in $(fmt_time $(( ($(now_us) - video_start) / 1000 ))) $on"
+    else
+        ok "Using the existing subtitles ${c_dim}(--force re-transcribes)$c_reset"
+    fi
+
+    if (( need_txt )); then
+        rm -f -- "$txt"  # so a stale transcript is never reported as new
+        if postprocess "$srt" "$txt" "$limit_s" 2> "$work/awk.log"; then
+            if (( transcribed )); then ok "Transcript written"; else ok "Transcript rebuilt from the subtitles"; fi
+            if [[ ! -s $srt ]]; then  # every cue was past the end of the video
+                err "No speech found"
+                (( cur_created )) && { rm -f -- "$srt" "$txt"; rmdir -- "$out_dir" 2>/dev/null; }
+                return 1
+            fi
+        else
+            warn "Couldn't clean up subtitles or write the transcript"
+            tail -n 3 "$work/awk.log" | sed 's/^/    /' >&2
+        fi
+    fi
+
+    if (( need_mux )); then
+        # With --language auto, tag the track with the language Whisper detected.
+        tag=$lang_tag title=$track_title
+        if (( transcribed )) && [[ $language == auto ]]; then
+            detected=$(sed -n 's/.*auto-detected language: \([a-z]*\).*/\1/p' "$log" | head -1)
+            if [[ -n $detected ]]; then
+                tag=$(language_tag "$detected")
+                [[ $detected == en ]] && title="English (Whisper)" || title="$detected (Whisper)"
+            fi
+        fi
+
+        # New subtitle track goes after any existing ones, so its index = existing count.
+        # (Only count numeric lines: newer ffprobe also prints blank lines for stream groups.)
+        sub_index=$("$FFPROBE" -v error -select_streams s -show_entries stream=index -of csv=p=0 -- "$video" 2>/dev/null \
+            | grep -cE '^[0-9]+$')
+
+        # -map -0:d? drops data streams (e.g. timecode), which often can't be copied between containers.
+        partial=$out
+        if ! "$FFMPEG" -hide_banner -loglevel error -nostdin -y \
+                -i "$video" -i "$srt" \
+                -map 0 -map -0:d? -map 1:0 \
+                -c copy -c:s:$sub_index $sub_codec \
+                -metadata:s:s:$sub_index language=$tag \
+                -metadata:s:s:$sub_index title="$title" \
+                "$out" 2> "$log"; then
+            err "ffmpeg failed to add the subtitle track"
+            tail -n 5 "$log" | sed 's/^/    /' >&2
+            rm -f -- "$out"; partial=''
+            return 1
+        fi
+        partial=''
+        # An older subtitled copy in another container (e.g. .mkv before, .mp4 now) is superseded.
+        [[ -n $existing_out && $existing_out != "$out" ]] && rm -f -- "$existing_out"
+        existing_out=$out
+        ok "Subtitle track added"
+    fi
+
+    original_display=$filename
+    if (( ! keep_original )); then
+        rm -f -- "$video"; original_display=''
+    elif [[ $src_dir != "$out_dir" ]]; then
+        mv -n -- "$video" "$out_dir/"
+        if [[ -e $video ]]; then
+            warn "Original not moved: a file named \"$filename\" is already in the folder"
+            original_display="$video (not moved)"
+        else
+            ok "Original moved into the folder"
+            original_display="$filename (moved here)"
+        fi
+    fi
+
+    elapsed=$(( ($(now_us) - video_start) / 1000 ))
+    timing="$c_green${c_bold}Done in $(fmt_time $elapsed)$c_reset"
+    if (( transcribed )) && [[ -n $duration ]] && (( elapsed > 0 )); then
+        speed=$(( duration * 10 / elapsed ))
+        timing+="  $c_dim($(fmt_time $duration) of video · $(( speed / 10 )).$(( speed % 10 ))× real time)$c_reset"
+    fi
+    echo
+    echo "  $timing"
+    echo "  ${c_dim}Folder:     $c_reset$out_dir/"
+    [[ -n $existing_out ]] && echo "  ${c_dim}Video:      $c_reset${existing_out##*/}"
+    echo "  ${c_dim}Subtitles:  $c_reset${srt##*/}"
+    [[ -s $txt ]] && echo "  ${c_dim}Transcript: $c_reset${txt##*/}"
+    [[ -n $original_display ]] && echo "  ${c_dim}Original:   $c_reset$original_display"
+    return 0
+}
+
+# ---------------------------------------------------------------------------------------------
+# --channel: download each video from YouTube channels, playlists or video links with yt-dlp and
+# process it. Each video's folder name ends in "[VIDEO_ID] (subtitled)", which is how later runs
+# recognize it (even if the title changed) and fill in only what's missing.
+
+yt_dlp_common() {  # options shared by every yt-dlp call
+    printf '%s\0' --ignore-config --no-warnings --sleep-requests 1 --ffmpeg-location "${FFMPEG%/*}"
+}
+
+channel_mode() {
+    command -v yt-dlp > /dev/null || die "--channel needs yt-dlp, which isn't installed.
+  Install it with your package manager (e.g. 'sudo pacman -S yt-dlp', 'sudo apt install yt-dlp')
+  or see https://github.com/yt-dlp/yt-dlp#installation"
+    local common=() urls=() url src line ids=() titles=() id title i n folder name
+    local done_n=0 skipped=0 failed_n=0 dl_args=() path target have_srt have_txt have_vid f rc
+    local date raw ext list_failed=0 before
+    local -A seen_ids=()
+    while IFS= read -r -d '' f; do common+=("$f"); done < <(yt_dlp_common)
+
+    # Sources: URLs, or text files with one URL per line (blank lines and # comments ignored).
+    for src in "${channel_sources[@]}"; do
+        if [[ -f $src ]]; then
+            while IFS= read -r line || [[ -n $line ]]; do
+                line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+                [[ -z $line || $line == '#'* ]] && continue
+                urls+=("$line")
+            done < "$src"
+        elif [[ $src =~ ^(https?://)?((www|m|music)\.)?(youtube\.com|youtu\.be)/ ]]; then
+            urls+=("$src")
+        else
+            die "--channel $src: not a YouTube URL or a file of URLs"
+        fi
+    done
+    (( ${#urls[@]} )) || die "--channel: no URLs given"
+
+    out_root=$(realpath -m -- "${out_root:-$PWD}")
+    mkdir -p -- "$out_root" || die "couldn't create $out_root"
+    stage=$out_root/.whisper-subs-downloading
+
+    # List every source's videos; a video in several sources is processed once.
+    local list_args=(--flat-playlist --print '%(id)s	%(title)s')
+    (( limit )) && list_args+=(--playlist-items "1:$limit")
+    for url in "${urls[@]}"; do
+        # A channel's main page lists tabs (Videos, Shorts, Live); use its Videos tab.
+        if [[ $url =~ ^(https?://)?(www\.|m\.)?youtube\.com/(@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+)/?$ ]]; then
+            url=${url%/}/videos
+        fi
+        echo "${c_bold}Listing:$c_reset $url"
+        yt-dlp "${common[@]}" "${list_args[@]}" "$url" > "$work/list"
+        rc=$?
+        before=${#ids[@]}
+        while IFS=$'\t' read -r id title; do
+            [[ -n $id && -z ${seen_ids[$id]:-} ]] || continue
+            seen_ids[$id]=1; ids+=("$id"); titles+=("$title")
+        done < "$work/list"
+        if (( rc != 0 )) && (( ${#ids[@]} == before )); then
+            err "Couldn't list $url (yt-dlp exit $rc)"; (( list_failed++ ))
+        else
+            echo "  $(( ${#ids[@]} - before )) new video(s)"
+        fi
+    done
+    n=${#ids[@]}
+    (( n )) || die "no videos found"
+    echo "  $n video(s) in total · output: $out_root/"
+    (( subs_only )) && echo "  ${c_dim}--subs-only: downloading audio only; subtitles and transcripts only$c_reset"
+
+    local run_start
+    run_start=$(now_us)
+    for (( i = 0; i < n; i++ )); do
+        id=${ids[i]} title=${titles[i]}
+        echo
+        echo "$c_bold$c_cyan━━ [$(( i + 1 ))/$n]$c_reset $c_bold$title$c_reset ${c_dim}[$id]$c_reset"
+
+        # Existing folder for this video?
+        folder=''
+        for f in "$out_root"/*"[$id] (subtitled)"; do [[ -d $f ]] && { folder=$f; break; }; done
+        have_srt=0 have_txt=0 have_vid=0
+        if [[ -n $folder ]]; then
+            name=${folder##*/}; name=${name% (subtitled)}
+            [[ -s $folder/$name.srt ]] && have_srt=1
+            [[ -s $folder/$name.txt ]] && have_txt=1
+            for f in "$folder/$name".subtitled.*; do [[ -f $f ]] && { have_vid=1; break; }; done
+        fi
+        if (( ! force && have_srt && have_txt && (subs_only || have_vid) )); then
+            ok "Already done"; (( skipped++ )); continue
+        fi
+        # Only the transcript is missing: rebuild it from the subtitles, no download needed.
+        if (( ! force && have_srt && ! have_txt && (subs_only || have_vid) )); then
+            if postprocess "$folder/$name.srt" "$folder/$name.txt" ''; then
+                ok "Transcript rebuilt from the subtitles"; (( done_n++ ))
+            else
+                err "Couldn't rebuild the transcript"; (( failed_n++ ))
+            fi
+            continue
+        fi
+
+        # Download: audio only if all we need is subtitles; otherwise the best video up to
+        # 720p (MP4 preferred so the output stays MP4). Transcription quality depends only
+        # on the audio.
+        if (( subs_only )); then
+            dl_args=(-f 'ba/b' -S 'ext:m4a')
+            echo "  ${c_dim}Downloading audio…$c_reset"
+        else
+            dl_args=(-S 'res:720,ext:mp4:m4a')
+            if (( have_srt && ! force )); then echo "  ${c_dim}Downloading the video (subtitles already exist)…$c_reset"
+            else echo "  ${c_dim}Downloading…$c_reset"
+            fi
+        fi
+        rm -rf -- "$stage"; mkdir -p -- "$stage"; rm -f -- "$work/downloaded"
+        # yt-dlp's progress bar only on a terminal (in a log it's a pile of \r-joined updates).
+        (( tty )) && dl_args+=(--progress --progress-template \
+            "download:  ${c_dim}%(progress._percent_str)s of %(progress._total_bytes_str)s · %(progress._speed_str)s$c_reset")
+        # Saved as VIDEO_ID.ext; the tidy name is made from the raw title afterwards. YouTube
+        # sometimes refuses a download for a moment (e.g. "HTTP Error 403"), so one retry after a
+        # pause -- unless the error is one that won't go away (private, removed, members-only...).
+        local attempt
+        for attempt in 1 2; do
+            yt-dlp "${common[@]}" "${dl_args[@]}" -q --no-playlist \
+                --sleep-interval 5 --max-sleep-interval 10 \
+                -o "$stage/%(id)s.%(ext)s" \
+                --print-to-file "after_move:%(filepath)s"$'\x1f'"%(upload_date>%Y-%m-%d)s"$'\x1f'"%(title)s" "$work/downloaded" \
+                "https://www.youtube.com/watch?v=$id" 2> >(tee "$work/dl.err" >&2)
+            rc=$?
+            wait  # for tee to finish writing dl.err
+            (( rc == 0 )) && break
+            if (( attempt == 1 )) && ! grep -qiE 'private video|video unavailable|not available|members|join this channel|been removed|terminated|confirm your age|copyright' "$work/dl.err"; then
+                warn "Download failed; trying once more in 15 s"
+                sleep 15
+                rm -rf -- "$stage"; mkdir -p -- "$stage"; rm -f -- "$work/downloaded"
+            else
+                break
+            fi
+        done
+        path='' date='' raw=''
+        [[ -f $work/downloaded ]] && IFS=$'\x1f' read -r -d '' path date raw < "$work/downloaded"
+        if (( rc != 0 )) || [[ ! -f $path ]]; then
+            err "Download failed (yt-dlp exit $rc)"; (( failed_n++ )); rm -rf -- "$stage"; continue
+        fi
+        (( tty )) && printf '\r\e[2K'
+
+        # Into the existing folder under its name (so the .srt is reused), or a new, tidily
+        # named one: "DATE TITLE [VIDEO_ID]".
+        ext=${path##*.}
+        if [[ -n $folder ]]; then
+            target=$folder/$name.$ext
+        else
+            [[ $date =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || date=''
+            target="$out_root/${date:+$date }$(clean_title "${raw:-$title}") [$id].$ext"
+        fi
+        mv -f -- "$path" "$target" && rm -rf -- "$stage"
+
+        # The download is ours: once its subtitled copy exists (or, with --subs-only, once it's
+        # transcribed) it's deleted rather than kept alongside, which would double the disk use.
+        process_video "$target" 0
+        case $? in
+            0) (( done_n++ )) ;;
+            2) (( skipped++ )) ;;
+            *) (( failed_n++ )); rm -f -- "$target" ;;
+        esac
+    done
+
+    echo
+    local summary="Channel: $done_n processed, $skipped already done, $(( failed_n + list_failed )) failed · $(fmt_time $(( ($(now_us) - run_start) / 1000 )))"
+    if (( failed_n + list_failed == 0 )); then echo "$c_green$c_bold━━ $summary$c_reset"
+    else echo "$c_yellow$c_bold━━ $summary$c_reset"
+    fi
+    (( failed_n + list_failed == 0 ))
+}
+
+if (( ${#channel_sources[@]} )); then
+    channel_mode
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Local files
+
+if (( ${#inputs[@]} == 0 )); then
+    [[ -t 0 ]] || { usage >&2; exit 1; }
+    read -e -r -p "${c_bold}Drag video file(s) here and press Enter:${c_reset} " input || exit 1
+    while IFS= read -r -d '' p; do inputs+=("$p"); done < <(parse_dropped "$input")
+fi
+
+# Absolute paths keep names like "-x.mp4" from being read as options by the tools below,
+# and let the same file given twice be processed once.
+videos=()
+declare -A seen=()
+for v in "${inputs[@]}"; do
+    abs=$(realpath -m -- "$v")
+    [[ -n ${seen[$abs]:-} ]] && continue
+    seen[$abs]=1
+    videos+=("$abs")
+done
+(( ${#videos[@]} )) || { err "No files given."; exit 1; }
+
+total=${#videos[@]}
+failed=0
+done_count=0
+run_start=$(now_us)
+
+for (( i = 0; i < total; i++ )); do
+    echo
+    echo "$c_bold$c_cyan━━ [$(( i + 1 ))/$total]$c_reset $c_bold${videos[i]##*/}$c_reset"
+    process_video "${videos[i]}" 1
+    case $? in
+        0|2) (( done_count++ )) ;;
+        *) (( failed++ )) ;;
+    esac
+done
+
+if (( total > 1 )); then
+    echo
+    summary="Finished $done_count of $total videos in $(fmt_time $(( ($(now_us) - run_start) / 1000 )))"
+    if (( failed == 0 )); then echo "$c_green$c_bold━━ $summary$c_reset"
+    else echo "$c_yellow$c_bold━━ $summary ($failed failed)$c_reset"
+    fi
+fi
+
+(( failed == 0 ))
